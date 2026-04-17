@@ -4,11 +4,14 @@
 
 USAGE:
     video_loop_finder.py [options] VIDEO_PATH [START_FRAME_IDX [DURATION_HINT]]
+    video_loop_finder.py [options] --scan-starts VIDEO_PATH [DURATION_HINT]
 
 ARGUMENTS:
     VIDEO_PATH          Path to a video file or printf-style escaped path to image
                         sequence, e.g. '/path/to/image%04d.png'
     START_FRAME_IDX     Index of first frame of loop [default: 0]
+                        In --scan-starts mode, a single positional integer is
+                        interpreted as DURATION_HINT for convenience
     DURATION_HINT       Estimated duration of loop in frames [default: video duration]
 
 OPTIONS:
@@ -25,6 +28,13 @@ OPTIONS:
                                         chaining forward and backward flows together, do
                                         not map back onto themselves within PIXELS. Set
                                         to 'off' to disable filtering. [default: 0.2]
+    --scan-starts                       Evaluate multiple candidate start frames and
+                                        pick the best loop overall
+    --start-step=STEP                   Step size between candidate start frames when
+                                        --scan-starts is enabled [default: 12]
+    --start-max=MAX                     Maximum candidate start frame index (inclusive)
+                                        in --scan-starts mode. Set to 0 to scan as far
+                                        as possible [default: 0]
     -i --interactive                    Enable interactive alignment of start and end
                                         frames
     -d --debug                          Enable more verbose logging and plot interme-
@@ -60,6 +70,11 @@ from schema import Schema, Use, And, Or, SchemaError
 import ffmpeg
 import os
 from textwrap import dedent
+from scan_start_utils import (
+    format_ranked_candidates,
+    generate_start_frame_indices,
+    resolve_scan_duration_hint,
+)
 
 
 # Set up custom logger
@@ -171,6 +186,7 @@ class VideoLoopFinder:
 
         # Will be populated by find_closest_end_frame
         self.end_frames = None
+        self.match_score = np.inf
 
     def _seek(self, frame_idx, downsample=True, grayscale=True, normalise=True):
         self.video.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -302,6 +318,8 @@ class VideoLoopFinder:
             self._plot_dissimilarity(
                 end_frame_range, mads, "Mean absolute pixel difference"
             )
+
+        self.match_score = min_diff
 
         return self.start_frame_idx, self.end_frame_idx
 
@@ -612,6 +630,70 @@ class VideoLoopFinder:
         )
 
 
+def get_video_duration(video_path):
+    """Get the number of frames in a video or image sequence."""
+    video = cv2.VideoCapture(video_path)
+    try:
+        video_duration = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        if video_duration == 0:
+            video_duration = -1
+            success = True
+            while success:
+                video_duration += 1
+                success, _ = video.read()
+        return video_duration
+    finally:
+        video.release()
+
+
+def find_loop_for_start(
+    video_path,
+    *,
+    start_frame_idx,
+    duration_hint,
+    search_range,
+    resolution,
+    flow_filter_threshold,
+    match_brightness_range,
+    debug,
+    interactive,
+):
+    """Find one loop candidate for a given start frame."""
+    vlf = VideoLoopFinder(
+        video_path,
+        start_frame_idx=start_frame_idx,
+        duration_hint=duration_hint,
+        resolution=resolution,
+        flow_filter_threshold=flow_filter_threshold,
+        match_brightness_range=match_brightness_range,
+        debug=debug,
+        interactive=interactive,
+    )
+
+    try:
+        loop_start_frame_idx, end_frame_idx = vlf.find_closest_end_frame(
+            search_range=search_range
+        )
+
+        if match_brightness_range > 0:
+            vlf.match_brightness()
+            loop_start_frame_idx, end_frame_idx = vlf.find_closest_end_frame(
+                search_range=2
+            )
+
+        return {
+            "candidate_start_frame_idx": (
+                loop_start_frame_idx if start_frame_idx is None else start_frame_idx
+            ),
+            "start_frame_idx": loop_start_frame_idx,
+            "end_frame_idx": end_frame_idx,
+            "end_frame_position": vlf.localise_end_frame(),
+            "score": vlf.match_score,
+        }
+    finally:
+        vlf.video.release()
+
+
 if __name__ == "__main__":
 
     opts = docopt(__doc__)
@@ -623,6 +705,8 @@ if __name__ == "__main__":
             "--range": And(Use(int), lambda r: r >= 0),
             "--match-brightness": And(Use(int), lambda r: r >= 0),
             "--width": And(Use(int), lambda w: w >= 0),
+            "--start-step": And(Use(int), lambda s: s > 0),
+            "--start-max": And(Use(int), lambda m: m >= 0),
             "--flow-filter": Or(
                 And(lambda f: f.lower().strip() == "off", Use(lambda f: None)),
                 And(Use(float), lambda t: t >= 0),
@@ -651,26 +735,79 @@ if __name__ == "__main__":
     except SchemaError as e:
         exit(e)
 
-    vlf = VideoLoopFinder(
-        opts["VIDEO_PATH"],
-        start_frame_idx=opts["START_FRAME_IDX"],
-        duration_hint=opts["DURATION_HINT"],
-        resolution=opts["--width"],
-        flow_filter_threshold=opts["--flow-filter"],
-        match_brightness_range=opts["--match-brightness"],
-        debug=opts["--debug"],
-        interactive=opts["--interactive"],
-    )
+    if opts["--scan-starts"]:
+        duration_hint = resolve_scan_duration_hint(
+            opts["START_FRAME_IDX"], opts["DURATION_HINT"]
+        )
+        video_duration = get_video_duration(opts["VIDEO_PATH"])
+        candidate_start_indices = generate_start_frame_indices(
+            video_duration,
+            opts["--start-step"],
+            opts["--start-max"],
+        )
+        if len(candidate_start_indices) == 0:
+            exit("No candidate start frames generated. Check --start-step/--start-max")
 
-    start_frame_idx, end_frame_idx = vlf.find_closest_end_frame(
-        search_range=opts["--range"]
-    )
+        logger.info(
+            "Scanning %d candidate start frames (step=%d, max=%d)",
+            len(candidate_start_indices),
+            opts["--start-step"],
+            opts["--start-max"],
+        )
 
-    if opts["--match-brightness"] > 0:
-        vlf.match_brightness()
-        start_frame_idx, end_frame_idx = vlf.find_closest_end_frame(search_range=2)
+        candidates = []
+        for start_idx in candidate_start_indices:
+            logger.info("Evaluating candidate start frame %d", start_idx)
+            candidates.append(
+                find_loop_for_start(
+                    opts["VIDEO_PATH"],
+                    start_frame_idx=start_idx,
+                    duration_hint=duration_hint,
+                    search_range=opts["--range"],
+                    resolution=opts["--width"],
+                    flow_filter_threshold=opts["--flow-filter"],
+                    match_brightness_range=opts["--match-brightness"],
+                    debug=False,
+                    interactive=False,
+                )
+            )
 
-    end_frame_position = vlf.localise_end_frame()
+        ranked_candidates = sorted(candidates, key=lambda candidate: candidate["score"])
+        print(format_ranked_candidates(ranked_candidates, top_n=5))
+
+        best_candidate = ranked_candidates[0]
+        best_candidate_start_idx = best_candidate["candidate_start_frame_idx"]
+        if opts["--debug"] or opts["--interactive"]:
+            best_candidate = find_loop_for_start(
+                opts["VIDEO_PATH"],
+                start_frame_idx=best_candidate_start_idx,
+                duration_hint=duration_hint,
+                search_range=opts["--range"],
+                resolution=opts["--width"],
+                flow_filter_threshold=opts["--flow-filter"],
+                match_brightness_range=opts["--match-brightness"],
+                debug=opts["--debug"],
+                interactive=opts["--interactive"],
+            )
+
+        start_frame_idx = best_candidate["start_frame_idx"]
+        end_frame_idx = best_candidate["end_frame_idx"]
+        end_frame_position = best_candidate["end_frame_position"]
+    else:
+        best_candidate = find_loop_for_start(
+            opts["VIDEO_PATH"],
+            start_frame_idx=opts["START_FRAME_IDX"],
+            duration_hint=opts["DURATION_HINT"],
+            search_range=opts["--range"],
+            resolution=opts["--width"],
+            flow_filter_threshold=opts["--flow-filter"],
+            match_brightness_range=opts["--match-brightness"],
+            debug=opts["--debug"],
+            interactive=opts["--interactive"],
+        )
+        start_frame_idx = best_candidate["start_frame_idx"]
+        end_frame_idx = best_candidate["end_frame_idx"]
+        end_frame_position = best_candidate["end_frame_position"]
 
     print(
         dedent(
@@ -685,7 +822,7 @@ if __name__ == "__main__":
 
     if opts["--outfile"]:
         logger.info(f"Exporting trimmed video to {opts['--outfile']}...")
-        vlf.trim_video(
+        VideoLoopFinder.trim_video(
             opts["VIDEO_PATH"],
             start_frame_idx,
             end_frame_idx,
