@@ -10,5 +10,5 @@ dependencies:
   - docopt
   - schema
   - ffmpeg-python
-  - ffmpeg=4.2=h1a5d6f3_0
+  - ffmpeg
 
