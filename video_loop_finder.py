@@ -4,7 +4,6 @@
 
 USAGE:
     video_loop_finder.py [options] VIDEO_PATH [START_FRAME_IDX [DURATION_HINT]]
-    video_loop_finder.py [options] --scan-starts VIDEO_PATH [DURATION_HINT]
 
 ARGUMENTS:
     VIDEO_PATH          Path to a video file or printf-style escaped path to image
@@ -31,10 +30,23 @@ OPTIONS:
     --scan-starts                       Evaluate multiple candidate start frames and
                                         pick the best loop overall
     --start-step=STEP                   Step size between candidate start frames when
-                                        --scan-starts is enabled [default: 12]
+                                        scan mode is enabled [default: 12]
     --start-max=MAX                     Maximum candidate start frame index (inclusive)
                                         in --scan-starts mode. Set to 0 to scan as far
                                         as possible [default: 0]
+    --loop-engine                       Enable loop-engine export mode that synthesizes
+                                        seam bridge frames for smoother looping
+    --engine-blend=FRAMES               Number of seam bridge frames. Set to 0 for
+                                        automatic estimation [default: 0]
+    --engine-min-blend=FRAMES           Minimum auto-estimated seam bridge frames in
+                                        loop-engine mode [default: 4]
+    --engine-max-blend=FRAMES           Maximum auto-estimated seam bridge frames in
+                                        loop-engine mode [default: 24]
+    --engine-style=STYLE                Seam synthesis style in loop-engine mode:
+                                        auto, flow, or blend [default: auto]
+    --engine-switch-margin=RATIO        Relative improvement required before auto style
+                                        switches between flow and blend. Set to 0 to
+                                        disable hysteresis [default: 0.05]
     -i --interactive                    Enable interactive alignment of start and end
                                         frames
     -d --debug                          Enable more verbose logging and plot interme-
@@ -72,8 +84,14 @@ import os
 from textwrap import dedent
 from scan_start_utils import (
     format_ranked_candidates,
+    generate_engine_bridge_plan,
     generate_start_frame_indices,
+    rank_loop_candidates,
+    resolve_engine_blend_frames,
+    resolve_engine_switch_margin,
     resolve_scan_duration_hint,
+    select_engine_bridge_style,
+    select_backoff_candidate,
 )
 
 
@@ -82,6 +100,32 @@ logger = logging.Logger(__name__, level=logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(levelname)s\t%(message)s"))
 logger.addHandler(handler)
+
+
+MAX_END_FRAME_BACKOFF = 24
+MAX_END_FRAME_FORWARD = 3
+MIN_BACKOFF_LOOP_FRAMES = 2
+DEFAULT_FFMPEG_EXPORT_OPTIONS = {
+    "q:v": "2",
+    "movflags": "+faststart",
+}
+BACKOFF_END_POSITION_WEIGHT = 4.0
+BACKOFF_BRIGHTNESS_WEIGHT = 0.2
+BACKOFF_DISTANCE_WEIGHT = 0.05
+BACKOFF_DURATION_WEIGHT = 0.25
+BACKOFF_SCORE_EPSILON = 1e-6
+FFMPEG_QUALITY_KEYS = {
+    "vcodec",
+    "c:v",
+    "codec:v",
+    "crf",
+    "q:v",
+    "qscale:v",
+    "qp",
+    "b:v",
+}
+ENGINE_STYLES = {"auto", "flow", "blend"}
+AUTO_ENGINE_STYLE_SWITCH_MARGIN = 0.05
 
 
 class VideoLoopDirection(Enum):
@@ -592,12 +636,38 @@ class VideoLoopFinder:
         # We are only interested in the horizontal components
         flow_magnitudes = [np.abs(f[..., int(self.vertical)]) for f in flows]
         flow_magnitude_sum = sum(flow_magnitudes)
+        valid_flow = flow_magnitude_sum != 0
 
         full_frame_count = self.end_frame_idx - self.start_frame_idx
+        if full_frame_count <= 0:
+            logger.warning(
+                "Degenerate loop candidate detected (start=%d, end=%d)",
+                self.start_frame_idx,
+                self.end_frame_idx,
+            )
+            return np.nan
+
+        if not np.any(valid_flow):
+            logger.warning(
+                "Could not localise end frame: optical flow magnitudes are all zero"
+            )
+            return np.nan
+
         fractional_frame_count = np.nanmedian(
-            flow_magnitudes[0][flow_magnitude_sum != 0]
-            / flow_magnitude_sum[flow_magnitude_sum != 0]
+            flow_magnitudes[0][valid_flow] / flow_magnitude_sum[valid_flow]
         )
+
+        if not np.isfinite(fractional_frame_count):
+            logger.warning(
+                "Could not localise end frame: invalid fractional frame count"
+            )
+            return np.nan
+
+        denominator = full_frame_count + fractional_frame_count
+        if denominator <= 0 or not np.isfinite(denominator):
+            logger.warning("Could not localise end frame: invalid denominator")
+            return np.nan
+
         logger.info(
             f"Frame {self.start_frame_idx} lies at {100*fractional_frame_count:.0f}%"
             f" between frames {self.end_frame_idx} and {self.end_frame_idx + 1}"
@@ -616,7 +686,7 @@ class VideoLoopFinder:
                 f"between frames {self.end_frame_idx} and {self.end_frame_idx + 1}"
             )
 
-        return full_frame_count / (full_frame_count + fractional_frame_count)
+        return full_frame_count / denominator
 
     @staticmethod
     def trim_video(in_filepath, from_idx, to_idx, out_filepath, ffmpeg_options):
@@ -628,6 +698,247 @@ class VideoLoopFinder:
             .output(out_filepath, **ffmpeg_options)
             .run()
         )
+
+    @staticmethod
+    def _smoothstep01(value):
+        value = float(np.clip(value, 0.0, 1.0))
+        return value * value * (3.0 - 2.0 * value)
+
+    @staticmethod
+    def _remap_with_flow(frame, flow, flow_scale):
+        height, width = frame.shape[:2]
+        grid_x, grid_y = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
+        )
+        map_x = grid_x + flow[..., 0].astype(np.float32) * float(flow_scale)
+        map_y = grid_y + flow[..., 1].astype(np.float32) * float(flow_scale)
+        return cv2.remap(
+            frame,
+            map_x,
+            map_y,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT101,
+        )
+
+    @staticmethod
+    def _synthesize_blend_bridge_frame(tail_frame, head_frame, progress):
+        alpha = VideoLoopFinder._smoothstep01(progress)
+        return cv2.addWeighted(
+            tail_frame,
+            1.0 - alpha,
+            head_frame,
+            alpha,
+            0.0,
+        )
+
+    @staticmethod
+    def _bridge_quality_score(candidate_frame, head_frame, prev_frame):
+        # Lower is better: target alignment + temporal continuity.
+        target_error = np.abs(candidate_frame.astype(np.float32) - head_frame.astype(np.float32)).mean()
+        temporal_error = np.abs(candidate_frame.astype(np.float32) - prev_frame.astype(np.float32)).mean()
+        return 0.7 * target_error + 0.3 * temporal_error
+
+    @staticmethod
+    def _synthesize_flow_bridge_frame(tail_frame, head_frame, progress):
+        alpha = VideoLoopFinder._smoothstep01(progress)
+        tail_gray = cv2.cvtColor(tail_frame, cv2.COLOR_BGR2GRAY)
+        head_gray = cv2.cvtColor(head_frame, cv2.COLOR_BGR2GRAY)
+        flow_forward = cv2.calcOpticalFlowFarneback(
+            tail_gray,
+            head_gray,
+            None,
+            0.5,
+            3,
+            25,
+            3,
+            5,
+            1.2,
+            0,
+        )
+        flow_backward = cv2.calcOpticalFlowFarneback(
+            head_gray,
+            tail_gray,
+            None,
+            0.5,
+            3,
+            25,
+            3,
+            5,
+            1.2,
+            0,
+        )
+
+        tail_warped = VideoLoopFinder._remap_with_flow(tail_frame, flow_forward, alpha)
+        head_warped = VideoLoopFinder._remap_with_flow(
+            head_frame,
+            flow_backward,
+            1.0 - alpha,
+        )
+        return cv2.addWeighted(
+            tail_warped,
+            1.0 - alpha,
+            head_warped,
+            alpha,
+            0.0,
+        )
+
+    @staticmethod
+    def export_loop_engine(
+        in_filepath,
+        from_idx,
+        to_idx,
+        out_filepath,
+        blend_frames,
+        engine_style,
+        switch_margin=AUTO_ENGINE_STYLE_SWITCH_MARGIN,
+    ):
+        """Export a loop and add synthetic seam bridge frames.
+
+        Depending on engine_style, bridge frames are synthesized by:
+            - blend: weighted blending
+            - flow: motion-compensated optical flow morphing
+            - auto: try flow and fallback to blend on failure
+        """
+        video = cv2.VideoCapture(in_filepath)
+        writer = None
+        try:
+            if engine_style not in ENGINE_STYLES:
+                engine_style = "auto"
+            switch_margin = resolve_engine_switch_margin(
+                switch_margin,
+                default_margin=AUTO_ENGINE_STYLE_SWITCH_MARGIN,
+            )
+
+            fps = float(video.get(cv2.CAP_PROP_FPS))
+            if not np.isfinite(fps) or fps <= 0:
+                fps = 24.0
+
+            video.set(cv2.CAP_PROP_POS_FRAMES, from_idx)
+            frames = []
+            for frame_idx in range(from_idx, to_idx + 1):
+                success, frame = video.read()
+                if not success:
+                    msg = f"Failed to read frame {frame_idx}"
+                    logger.fatal(msg)
+                    raise RuntimeError(msg)
+                frames.append(frame)
+
+            if len(frames) < 2:
+                msg = "Loop engine export requires at least two frames"
+                logger.fatal(msg)
+                raise RuntimeError(msg)
+
+            height, width = frames[0].shape[:2]
+            writer = cv2.VideoWriter(
+                out_filepath,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not open output writer for {out_filepath}")
+
+            for frame in frames:
+                writer.write(frame)
+
+            blend_frames = max(0, min(int(blend_frames), len(frames) - 1))
+            if blend_frames > 0:
+                plan = generate_engine_bridge_plan(len(frames), blend_frames)
+                flow_enabled = engine_style in {"auto", "flow"}
+                prev_frame = frames[-1]
+                previous_auto_style = None
+                auto_style_counts = {"flow": 0, "blend": 0}
+                auto_style_switches = 0
+                for step_idx, step in enumerate(plan, start=1):
+                    tail_frame = frames[step["tail_index"]]
+                    head_frame = frames[step["head_index"]]
+                    progress = step["progress"]
+
+                    blend_frame = VideoLoopFinder._synthesize_blend_bridge_frame(
+                        tail_frame,
+                        head_frame,
+                        progress,
+                    )
+
+                    flow_frame = None
+                    if flow_enabled:
+                        try:
+                            flow_frame = VideoLoopFinder._synthesize_flow_bridge_frame(
+                                tail_frame,
+                                head_frame,
+                                progress,
+                            )
+                        except cv2.error:
+                            if engine_style == "flow":
+                                flow_enabled = False
+                                logger.warning(
+                                    "Loop engine flow synthesis failed; falling back to blend"
+                                )
+                            flow_frame = None
+
+                    if engine_style == "blend":
+                        bridge_frame = blend_frame
+                    elif engine_style == "flow":
+                        bridge_frame = flow_frame if flow_frame is not None else blend_frame
+                    else:
+                        if flow_frame is None:
+                            bridge_frame = blend_frame
+                            previous_auto_style = "blend"
+                            auto_style_counts["blend"] += 1
+                        else:
+                            flow_score = VideoLoopFinder._bridge_quality_score(
+                                flow_frame,
+                                head_frame,
+                                prev_frame,
+                            )
+                            blend_score = VideoLoopFinder._bridge_quality_score(
+                                blend_frame,
+                                head_frame,
+                                prev_frame,
+                            )
+                            selected_style = select_engine_bridge_style(
+                                blend_score=blend_score,
+                                flow_score=flow_score,
+                                previous_style=previous_auto_style,
+                                switch_margin=switch_margin,
+                            )
+                            if (
+                                previous_auto_style is not None
+                                and selected_style != previous_auto_style
+                            ):
+                                auto_style_switches += 1
+                            bridge_frame = (
+                                flow_frame if selected_style == "flow" else blend_frame
+                            )
+                            auto_style_counts[selected_style] += 1
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "Loop engine auto frame %d/%d: flow=%.6f blend=%.6f selected=%s prev=%s",
+                                    step_idx,
+                                    len(plan),
+                                    flow_score,
+                                    blend_score,
+                                    selected_style,
+                                    previous_auto_style,
+                                )
+                            previous_auto_style = selected_style
+
+                    writer.write(bridge_frame)
+                    prev_frame = bridge_frame
+
+                if engine_style == "auto":
+                    logger.info(
+                        "Loop engine auto style summary: flow=%d blend=%d switches=%d margin=%.3f",
+                        auto_style_counts["flow"],
+                        auto_style_counts["blend"],
+                        auto_style_switches,
+                        switch_margin,
+                    )
+        finally:
+            if writer is not None:
+                writer.release()
+            video.release()
 
 
 def get_video_duration(video_path):
@@ -644,6 +955,17 @@ def get_video_duration(video_path):
         return video_duration
     finally:
         video.release()
+
+
+def resolve_ffmpeg_export_options(user_options):
+    """Apply quality-preserving defaults unless user set quality/codec options."""
+    options = dict(user_options or {})
+    if any(key in options for key in FFMPEG_QUALITY_KEYS):
+        return options
+
+    resolved_options = dict(DEFAULT_FFMPEG_EXPORT_OPTIONS)
+    resolved_options.update(options)
+    return resolved_options
 
 
 def find_loop_for_start(
@@ -681,15 +1003,112 @@ def find_loop_for_start(
                 search_range=2
             )
 
-        return {
-            "candidate_start_frame_idx": (
-                loop_start_frame_idx if start_frame_idx is None else start_frame_idx
-            ),
-            "start_frame_idx": loop_start_frame_idx,
-            "end_frame_idx": end_frame_idx,
-            "end_frame_position": vlf.localise_end_frame(),
-            "score": vlf.match_score,
-        }
+        backoff_limit = max(0, min(search_range, MAX_END_FRAME_BACKOFF))
+        forward_limit = max(0, min(search_range, MAX_END_FRAME_FORWARD))
+        minimum_end_frame_idx = loop_start_frame_idx + 1
+        maximum_end_frame_idx = vlf.video_duration - 2
+
+        effective_duration_hint = duration_hint
+        if (
+            effective_duration_hint is not None
+            and effective_duration_hint > 0
+            and effective_duration_hint >= vlf.video_duration
+        ):
+            effective_duration_hint = None
+
+        base_seam_score = max(float(vlf.match_score), BACKOFF_SCORE_EPSILON)
+        start_brightness = float(np.mean(vlf.start_frame))
+
+        candidate_end_indices = [end_frame_idx]
+        max_delta = max(backoff_limit, forward_limit)
+        for delta in range(1, max_delta + 1):
+            backoff_idx = end_frame_idx - delta
+            if backoff_idx >= minimum_end_frame_idx:
+                candidate_end_indices.append(backoff_idx)
+
+            forward_idx = end_frame_idx + delta
+            if delta <= forward_limit and forward_idx <= maximum_end_frame_idx:
+                candidate_end_indices.append(forward_idx)
+
+        normalisation_distance = max(1, max_delta)
+
+        backoff_candidates = []
+        for candidate_end_frame_idx in candidate_end_indices:
+
+            vlf.end_frame_idx = candidate_end_frame_idx
+            vlf.end_frames = [
+                vlf._seek(candidate_end_frame_idx),
+                vlf._seek(candidate_end_frame_idx + 1),
+            ]
+
+            seam_score = vlf._compute_pixel_difference(vlf.end_frames[0])
+            end_frame_position = vlf.localise_end_frame()
+            if np.isfinite(end_frame_position):
+                end_position_penalty = abs(1.0 - float(end_frame_position))
+            else:
+                end_position_penalty = 1.0
+
+            end_brightness = float(np.mean(vlf.end_frames[0]))
+            brightness_penalty = abs(start_brightness - end_brightness)
+
+            seam_search_distance = abs(candidate_end_frame_idx - end_frame_idx)
+            distance_penalty = seam_search_distance / float(normalisation_distance)
+
+            loop_length = candidate_end_frame_idx - loop_start_frame_idx
+            duration_penalty = 0.0
+            if effective_duration_hint is not None and effective_duration_hint > 0:
+                duration_penalty = abs(loop_length - effective_duration_hint) / float(
+                    effective_duration_hint
+                )
+
+            backoff_score = (
+                seam_score / base_seam_score
+                + BACKOFF_END_POSITION_WEIGHT * end_position_penalty
+                + BACKOFF_BRIGHTNESS_WEIGHT * brightness_penalty
+                + BACKOFF_DISTANCE_WEIGHT * distance_penalty
+                + BACKOFF_DURATION_WEIGHT * duration_penalty
+            )
+
+            backoff_candidates.append(
+                {
+                    "candidate_start_frame_idx": (
+                        loop_start_frame_idx
+                        if start_frame_idx is None
+                        else start_frame_idx
+                    ),
+                    "start_frame_idx": loop_start_frame_idx,
+                    "end_frame_idx": candidate_end_frame_idx,
+                    "end_frame_position": end_frame_position,
+                    "score": seam_score,
+                    "backoff_score": backoff_score,
+                }
+            )
+
+        if len(backoff_candidates) == 0:
+            return {
+                "candidate_start_frame_idx": (
+                    loop_start_frame_idx if start_frame_idx is None else start_frame_idx
+                ),
+                "start_frame_idx": loop_start_frame_idx,
+                "end_frame_idx": end_frame_idx,
+                "end_frame_position": vlf.localise_end_frame(),
+                "score": vlf.match_score,
+            }
+
+        selected_candidate = select_backoff_candidate(
+            backoff_candidates,
+            minimum_loop_frames=MIN_BACKOFF_LOOP_FRAMES,
+        )
+
+        if selected_candidate["end_frame_idx"] != backoff_candidates[0]["end_frame_idx"]:
+            logger.info(
+                "Using smarter backoff end frame %d instead of %d (score=%.6f)",
+                selected_candidate["end_frame_idx"],
+                backoff_candidates[0]["end_frame_idx"],
+                selected_candidate.get("backoff_score", float("nan")),
+            )
+
+        return selected_candidate
     finally:
         vlf.video.release()
 
@@ -707,6 +1126,15 @@ if __name__ == "__main__":
             "--width": And(Use(int), lambda w: w >= 0),
             "--start-step": And(Use(int), lambda s: s > 0),
             "--start-max": And(Use(int), lambda m: m >= 0),
+            "--engine-blend": And(Use(int), lambda f: f >= 0),
+            "--engine-min-blend": And(Use(int), lambda f: f > 0),
+            "--engine-max-blend": And(Use(int), lambda f: f > 0),
+            "--engine-style": And(
+                Use(lambda s: s.strip().lower()),
+                lambda s: s in ENGINE_STYLES,
+                error="Valid --engine-style values: auto, flow, blend",
+            ),
+            "--engine-switch-margin": And(Use(float), lambda m: 0.0 <= m <= 1.0),
             "--flow-filter": Or(
                 And(lambda f: f.lower().strip() == "off", Use(lambda f: None)),
                 And(Use(float), lambda t: t >= 0),
@@ -772,7 +1200,19 @@ if __name__ == "__main__":
                 )
             )
 
-        ranked_candidates = sorted(candidates, key=lambda candidate: candidate["score"])
+        minimum_loop_frames = max(2, opts["--start-step"])
+        if duration_hint is None and video_duration > 0:
+            minimum_loop_frames = max(
+                minimum_loop_frames,
+                int(np.ceil(0.25 * video_duration)),
+            )
+
+        ranked_candidates = rank_loop_candidates(
+            candidates,
+            duration_hint=duration_hint,
+            minimum_loop_frames=minimum_loop_frames,
+            video_duration=video_duration,
+        )
         print(format_ranked_candidates(ranked_candidates, top_n=5))
 
         best_candidate = ranked_candidates[0]
@@ -822,13 +1262,50 @@ if __name__ == "__main__":
 
     if opts["--outfile"]:
         logger.info(f"Exporting trimmed video to {opts['--outfile']}...")
-        VideoLoopFinder.trim_video(
-            opts["VIDEO_PATH"],
-            start_frame_idx,
-            end_frame_idx,
-            opts["--outfile"],
-            opts["--ffmpeg-opts"],
-        )
+        if opts["--loop-engine"]:
+            if opts["--engine-max-blend"] < opts["--engine-min-blend"]:
+                exit("--engine-max-blend must be >= --engine-min-blend")
+
+            bridge_candidate = {
+                "start_frame_idx": start_frame_idx,
+                "end_frame_idx": end_frame_idx,
+                "end_frame_position": end_frame_position,
+                "score": best_candidate.get("score", 0.0),
+            }
+            bridge_frames = resolve_engine_blend_frames(
+                bridge_candidate,
+                opts["--engine-blend"],
+                min_blend_frames=opts["--engine-min-blend"],
+                max_blend_frames=opts["--engine-max-blend"],
+            )
+            logger.info(
+                "Loop engine enabled: style=%s, synthesizing %d seam bridge frames",
+                opts["--engine-style"],
+                bridge_frames,
+            )
+            VideoLoopFinder.export_loop_engine(
+                opts["VIDEO_PATH"],
+                start_frame_idx,
+                end_frame_idx,
+                opts["--outfile"],
+                bridge_frames,
+                opts["--engine-style"],
+                opts["--engine-switch-margin"],
+            )
+        else:
+            ffmpeg_options = resolve_ffmpeg_export_options(opts["--ffmpeg-opts"])
+            if ffmpeg_options != opts["--ffmpeg-opts"]:
+                logger.info(
+                    "No explicit codec/quality ffmpeg options provided; applying defaults: %s",
+                    " ".join(f"{k}={v}" for k, v in ffmpeg_options.items()),
+                )
+            VideoLoopFinder.trim_video(
+                opts["VIDEO_PATH"],
+                start_frame_idx,
+                end_frame_idx,
+                opts["--outfile"],
+                ffmpeg_options,
+            )
         logger.info("...done")
 
     if opts["--debug"]:
