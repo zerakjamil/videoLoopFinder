@@ -108,10 +108,22 @@ With `--loop-engine`, the tool auto-estimates how many bridge frames to synthesi
 at the seam (or you can set `--engine-blend` explicitly) to improve boundary quality
 when the clip repeats.
 
+In auto mode, the engine now evaluates a wider local range of bridge-frame counts
+around the requested value and selects the strongest continuity candidate per clip.
+
 `--engine-style auto` now evaluates flow and blend candidates per bridge frame,
 chooses the lower-discontinuity result, and uses a small hysteresis margin to
 avoid style flicker on near-tie frames. `--engine-style flow` prefers optical-flow
 motion morphing and falls back to blend if flow fails on a frame.
+
+The bridge generator now anchors each synthesized seam frame to the previously
+emitted frame, which significantly reduces the jump at the start of the seam
+bridge and improves temporal continuity.
+
+In `--engine-style auto`, the loop engine now evaluates both reverse-head and
+forward-head seam trajectories and penalizes visible motion reversal at the seam.
+This helps avoid artifacts where elements appear to move backward right before
+the loop restarts.
 
 Tune the auto switching sensitivity with `--engine-switch-margin`:
 lower values switch styles more aggressively, while higher values keep style

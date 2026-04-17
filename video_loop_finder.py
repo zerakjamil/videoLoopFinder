@@ -126,6 +126,11 @@ FFMPEG_QUALITY_KEYS = {
 }
 ENGINE_STYLES = {"auto", "flow", "blend"}
 AUTO_ENGINE_STYLE_SWITCH_MARGIN = 0.05
+AUTO_ENGINE_BLEND_CANDIDATE_DELTAS = (-4, -3, -2, -1, 1, 2, 3, 4)
+AUTO_ENGINE_HEAD_MODES = ("reverse", "cyclic", "forward")
+MOTION_VECTOR_SAMPLE_WIDTH = 192
+MOTION_VECTOR_EPSILON = 1e-3
+MOTION_REVERSAL_SCORE_WEIGHT = 2.0
 
 
 class VideoLoopDirection(Enum):
@@ -784,6 +789,262 @@ class VideoLoopFinder:
         )
 
     @staticmethod
+    def _frame_difference(frame_a, frame_b):
+        return float(
+            np.mean(
+                np.abs(frame_a.astype(np.float32) - frame_b.astype(np.float32))
+            )
+        )
+
+    @staticmethod
+    def _resolve_bridge_plan(loop_frame_count, blend_frames, head_mode):
+        plan = generate_engine_bridge_plan(loop_frame_count, blend_frames)
+        if head_mode == "reverse":
+            return plan
+        if head_mode not in {"forward", "cyclic"}:
+            raise ValueError(f"Unsupported head_mode: {head_mode}")
+
+        effective_blend = len(plan)
+        if head_mode == "forward":
+            head_indices = list(range(effective_blend))
+        else:
+            # Forward progression near the seam with explicit closure to frame 0.
+            # Example for blend=8: [1,2,3,4,5,6,7,0]
+            if effective_blend <= 1:
+                head_indices = [0] * effective_blend
+            else:
+                head_indices = list(range(1, effective_blend)) + [0]
+
+        resolved_plan = []
+        for idx, step in enumerate(plan):
+            resolved_step = dict(step)
+            resolved_step["head_index"] = int(head_indices[idx])
+            resolved_plan.append(resolved_step)
+        return resolved_plan
+
+    @staticmethod
+    def _dominant_motion_vector(frame_a, frame_b):
+        try:
+            gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+            gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+
+            height, width = gray_a.shape[:2]
+            if width > MOTION_VECTOR_SAMPLE_WIDTH:
+                scale = MOTION_VECTOR_SAMPLE_WIDTH / float(width)
+                target_size = (
+                    MOTION_VECTOR_SAMPLE_WIDTH,
+                    max(2, int(round(height * scale))),
+                )
+                gray_a = cv2.resize(gray_a, target_size, interpolation=cv2.INTER_AREA)
+                gray_b = cv2.resize(gray_b, target_size, interpolation=cv2.INTER_AREA)
+
+            flow = cv2.calcOpticalFlowFarneback(
+                gray_a,
+                gray_b,
+                None,
+                0.5,
+                2,
+                15,
+                2,
+                5,
+                1.1,
+                0,
+            )
+            vector = np.median(flow.reshape(-1, 2), axis=0)
+            if not np.all(np.isfinite(vector)):
+                return np.array([0.0, 0.0], dtype=np.float32)
+            return vector.astype(np.float32)
+        except cv2.error:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+    @staticmethod
+    def _motion_reversal_penalty(frames, bridge_frames):
+        if len(frames) < 3:
+            return 0.0
+
+        sequence = [frames[-2], frames[-1], *bridge_frames, frames[0], frames[1]]
+        vectors = []
+        for idx in range(1, len(sequence)):
+            vectors.append(
+                VideoLoopFinder._dominant_motion_vector(
+                    sequence[idx - 1],
+                    sequence[idx],
+                )
+            )
+
+        if len(vectors) == 0:
+            return 0.0
+
+        reference = vectors[0]
+        reference_mag = float(np.linalg.norm(reference))
+        if reference_mag <= MOTION_VECTOR_EPSILON:
+            return 0.0
+
+        penalties = []
+        for vector in vectors[1:]:
+            magnitude = float(np.linalg.norm(vector))
+            if magnitude <= MOTION_VECTOR_EPSILON:
+                continue
+            cosine = float(np.dot(reference, vector) / (reference_mag * magnitude))
+            cosine = float(np.clip(cosine, -1.0, 1.0))
+            penalties.append(max(0.0, -cosine))
+
+        if len(penalties) == 0:
+            return 0.0
+        return float(np.mean(np.array(penalties, dtype=np.float32)))
+
+    @staticmethod
+    def _score_bridge_frames(frames, bridge_frames):
+        if len(bridge_frames) == 0:
+            seam = VideoLoopFinder._frame_difference(frames[-1], frames[0])
+            reversal_penalty = VideoLoopFinder._motion_reversal_penalty(
+                frames,
+                bridge_frames,
+            )
+            return {
+                "score": seam + MOTION_REVERSAL_SCORE_WEIGHT * reversal_penalty,
+                "boundary_jump": seam,
+                "seam_jump": seam,
+                "p95_jump": seam,
+                "reversal_penalty": reversal_penalty,
+            }
+
+        temporal_jumps = [
+            VideoLoopFinder._frame_difference(frames[-1], bridge_frames[0])
+        ]
+        for idx in range(1, len(bridge_frames)):
+            temporal_jumps.append(
+                VideoLoopFinder._frame_difference(
+                    bridge_frames[idx - 1],
+                    bridge_frames[idx],
+                )
+            )
+
+        boundary_jump = temporal_jumps[0]
+        seam_jump = VideoLoopFinder._frame_difference(bridge_frames[-1], frames[0])
+        p95_jump = float(np.percentile(np.array(temporal_jumps, dtype=np.float32), 95))
+        reversal_penalty = VideoLoopFinder._motion_reversal_penalty(
+            frames,
+            bridge_frames,
+        )
+
+        # Lower is better. Weight boundary smoothness most, then loop closure seam,
+        # then upper-tail temporal spikes inside the bridge. Add a motion reversal
+        # penalty to avoid visibly backward bridge motion near seam closure.
+        score = 0.55 * boundary_jump + 0.35 * seam_jump + 0.10 * p95_jump
+        score += MOTION_REVERSAL_SCORE_WEIGHT * reversal_penalty
+        return {
+            "score": score,
+            "boundary_jump": boundary_jump,
+            "seam_jump": seam_jump,
+            "p95_jump": p95_jump,
+            "reversal_penalty": reversal_penalty,
+        }
+
+    @staticmethod
+    def _build_bridge_frames(
+        frames,
+        blend_frames,
+        engine_style,
+        switch_margin,
+        head_mode,
+    ):
+        plan = VideoLoopFinder._resolve_bridge_plan(
+            len(frames),
+            blend_frames,
+            head_mode,
+        )
+        flow_enabled = engine_style in {"auto", "flow"}
+        prev_frame = frames[-1]
+        previous_auto_style = None
+        auto_style_counts = {"flow": 0, "blend": 0}
+        auto_style_switches = 0
+        bridge_frames = []
+
+        for step_idx, step in enumerate(plan, start=1):
+            # Keep bridge synthesis temporally continuous by always transitioning
+            # from the previously emitted frame toward the target head frame.
+            tail_frame = prev_frame
+            head_frame = frames[step["head_index"]]
+            progress = step["progress"]
+
+            blend_frame = VideoLoopFinder._synthesize_blend_bridge_frame(
+                tail_frame,
+                head_frame,
+                progress,
+            )
+
+            flow_frame = None
+            if flow_enabled:
+                try:
+                    flow_frame = VideoLoopFinder._synthesize_flow_bridge_frame(
+                        tail_frame,
+                        head_frame,
+                        progress,
+                    )
+                except cv2.error:
+                    if engine_style == "flow":
+                        flow_enabled = False
+                        logger.warning(
+                            "Loop engine flow synthesis failed; falling back to blend"
+                        )
+                    flow_frame = None
+
+            if engine_style == "blend":
+                bridge_frame = blend_frame
+            elif engine_style == "flow":
+                bridge_frame = flow_frame if flow_frame is not None else blend_frame
+            else:
+                if flow_frame is None:
+                    bridge_frame = blend_frame
+                    previous_auto_style = "blend"
+                    auto_style_counts["blend"] += 1
+                else:
+                    flow_score = VideoLoopFinder._bridge_quality_score(
+                        flow_frame,
+                        head_frame,
+                        prev_frame,
+                    )
+                    blend_score = VideoLoopFinder._bridge_quality_score(
+                        blend_frame,
+                        head_frame,
+                        prev_frame,
+                    )
+                    selected_style = select_engine_bridge_style(
+                        blend_score=blend_score,
+                        flow_score=flow_score,
+                        previous_style=previous_auto_style,
+                        switch_margin=switch_margin,
+                    )
+                    if (
+                        previous_auto_style is not None
+                        and selected_style != previous_auto_style
+                    ):
+                        auto_style_switches += 1
+                    bridge_frame = flow_frame if selected_style == "flow" else blend_frame
+                    auto_style_counts[selected_style] += 1
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Loop engine auto frame %d/%d: flow=%.6f blend=%.6f selected=%s prev=%s",
+                            step_idx,
+                            len(plan),
+                            flow_score,
+                            blend_score,
+                            selected_style,
+                            previous_auto_style,
+                        )
+                    previous_auto_style = selected_style
+
+            bridge_frames.append(bridge_frame)
+            prev_frame = bridge_frame
+
+        return bridge_frames, {
+            "flow": auto_style_counts["flow"],
+            "blend": auto_style_counts["blend"],
+            "switches": auto_style_switches,
+        }
+
+    @staticmethod
     def export_loop_engine(
         in_filepath,
         from_idx,
@@ -844,95 +1105,86 @@ class VideoLoopFinder:
 
             blend_frames = max(0, min(int(blend_frames), len(frames) - 1))
             if blend_frames > 0:
-                plan = generate_engine_bridge_plan(len(frames), blend_frames)
-                flow_enabled = engine_style in {"auto", "flow"}
-                prev_frame = frames[-1]
-                previous_auto_style = None
-                auto_style_counts = {"flow": 0, "blend": 0}
-                auto_style_switches = 0
-                for step_idx, step in enumerate(plan, start=1):
-                    tail_frame = frames[step["tail_index"]]
-                    head_frame = frames[step["head_index"]]
-                    progress = step["progress"]
+                candidate_blends = [blend_frames]
+                if engine_style == "auto":
+                    for delta in AUTO_ENGINE_BLEND_CANDIDATE_DELTAS:
+                        candidate = max(
+                            1,
+                            min(int(blend_frames + delta), len(frames) - 1),
+                        )
+                        candidate_blends.append(candidate)
 
-                    blend_frame = VideoLoopFinder._synthesize_blend_bridge_frame(
-                        tail_frame,
-                        head_frame,
-                        progress,
+                candidate_head_modes = ["reverse"]
+                if engine_style == "auto":
+                    candidate_head_modes = list(AUTO_ENGINE_HEAD_MODES)
+
+                best_candidate = None
+                for candidate_blend in sorted(set(candidate_blends)):
+                    for candidate_head_mode in candidate_head_modes:
+                        candidate_bridge_frames, candidate_auto_style_stats = (
+                            VideoLoopFinder._build_bridge_frames(
+                                frames,
+                                candidate_blend,
+                                engine_style,
+                                switch_margin,
+                                candidate_head_mode,
+                            )
+                        )
+                        candidate_quality = VideoLoopFinder._score_bridge_frames(
+                            frames,
+                            candidate_bridge_frames,
+                        )
+
+                        candidate_result = {
+                            "blend_frames": candidate_blend,
+                            "head_mode": candidate_head_mode,
+                            "bridge_frames": candidate_bridge_frames,
+                            "auto_style_stats": candidate_auto_style_stats,
+                            "quality": candidate_quality,
+                        }
+
+                        if (
+                            best_candidate is None
+                            or candidate_quality["score"]
+                            < best_candidate["quality"]["score"]
+                        ):
+                            best_candidate = candidate_result
+
+                selected_blend_frames = best_candidate["blend_frames"]
+                selected_head_mode = best_candidate["head_mode"]
+                selected_quality = best_candidate["quality"]
+
+                if engine_style == "auto" and selected_blend_frames != blend_frames:
+                    logger.info(
+                        "Loop engine auto adjusted bridge frames: requested=%d selected=%d (mode=%s boundary=%.4f seam=%.4f p95=%.4f reverse=%.4f)",
+                        blend_frames,
+                        selected_blend_frames,
+                        selected_head_mode,
+                        selected_quality["boundary_jump"],
+                        selected_quality["seam_jump"],
+                        selected_quality["p95_jump"],
+                        selected_quality["reversal_penalty"],
+                    )
+                elif engine_style == "auto":
+                    logger.info(
+                        "Loop engine auto selected bridge mode=%s (boundary=%.4f seam=%.4f p95=%.4f reverse=%.4f)",
+                        selected_head_mode,
+                        selected_quality["boundary_jump"],
+                        selected_quality["seam_jump"],
+                        selected_quality["p95_jump"],
+                        selected_quality["reversal_penalty"],
                     )
 
-                    flow_frame = None
-                    if flow_enabled:
-                        try:
-                            flow_frame = VideoLoopFinder._synthesize_flow_bridge_frame(
-                                tail_frame,
-                                head_frame,
-                                progress,
-                            )
-                        except cv2.error:
-                            if engine_style == "flow":
-                                flow_enabled = False
-                                logger.warning(
-                                    "Loop engine flow synthesis failed; falling back to blend"
-                                )
-                            flow_frame = None
-
-                    if engine_style == "blend":
-                        bridge_frame = blend_frame
-                    elif engine_style == "flow":
-                        bridge_frame = flow_frame if flow_frame is not None else blend_frame
-                    else:
-                        if flow_frame is None:
-                            bridge_frame = blend_frame
-                            previous_auto_style = "blend"
-                            auto_style_counts["blend"] += 1
-                        else:
-                            flow_score = VideoLoopFinder._bridge_quality_score(
-                                flow_frame,
-                                head_frame,
-                                prev_frame,
-                            )
-                            blend_score = VideoLoopFinder._bridge_quality_score(
-                                blend_frame,
-                                head_frame,
-                                prev_frame,
-                            )
-                            selected_style = select_engine_bridge_style(
-                                blend_score=blend_score,
-                                flow_score=flow_score,
-                                previous_style=previous_auto_style,
-                                switch_margin=switch_margin,
-                            )
-                            if (
-                                previous_auto_style is not None
-                                and selected_style != previous_auto_style
-                            ):
-                                auto_style_switches += 1
-                            bridge_frame = (
-                                flow_frame if selected_style == "flow" else blend_frame
-                            )
-                            auto_style_counts[selected_style] += 1
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(
-                                    "Loop engine auto frame %d/%d: flow=%.6f blend=%.6f selected=%s prev=%s",
-                                    step_idx,
-                                    len(plan),
-                                    flow_score,
-                                    blend_score,
-                                    selected_style,
-                                    previous_auto_style,
-                                )
-                            previous_auto_style = selected_style
-
+                for bridge_frame in best_candidate["bridge_frames"]:
                     writer.write(bridge_frame)
-                    prev_frame = bridge_frame
 
                 if engine_style == "auto":
+                    auto_style_stats = best_candidate["auto_style_stats"]
                     logger.info(
                         "Loop engine auto style summary: flow=%d blend=%d switches=%d margin=%.3f",
-                        auto_style_counts["flow"],
-                        auto_style_counts["blend"],
-                        auto_style_switches,
+                        auto_style_stats["flow"],
+                        auto_style_stats["blend"],
+                        auto_style_stats["switches"],
                         switch_margin,
                     )
         finally:
